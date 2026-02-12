@@ -1,5 +1,6 @@
+use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
-use reqwest::{Client, Error};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::fs;
 use tokio;
@@ -10,53 +11,53 @@ struct Config {
     timeout: u64,
 }
 
-async fn check_health(client: &Client, url: &String) -> (String, Result<(), Error>) {
-    let response = client.get(url).send().await;
+async fn check_health(client: &Client, url: &str) -> Result<()> {
+    let response = client.get(url).send().await.with_context(|| format!("Failed to send request to {}", url))?;
 
-    match response {
-        Ok(response) => {
-            if response.status().is_success() {
-                println!("{} is up and running!", url);
-                (url.clone(), Ok(()))
-            } else {
-                println!("Failed to reach {}: {}", url, response.status());
-                (url.clone(), Ok(()))
-            }
-        }
-        Err(e) => (url.clone(), Err(e)),
+    if response.status().is_success() {
+        println!("✅ {} is up and running!", url);
+        Ok(())
+    } else {
+        let status = response.status();
+        let error_message = match status {
+            StatusCode::NOT_FOUND => "Not Found (404)".to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR => "Internal Server Error (500)".to_string(),
+            _ => format!("Request failed with status: {}", status),
+        };
+        Err(anyhow!("{} - {}", url, error_message))
     }
 }
 
 #[tokio::main]
-async fn main() {
-    let config_content = match fs::read_to_string("config.toml") {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("Error reading config.toml: {}", e);
-            return;
-        }
-    };
+async fn main() -> Result<()> {
+    let config_content = fs::read_to_string("config.toml").context("Failed to read config.toml")?;
 
-    let config: Config = match toml::from_str(&config_content) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error parsing config.toml: {}", e);
-            return;
-        }
-    };
+    let config: Config = toml::from_str(&config_content).context("Failed to parse config.toml")?;
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout))
         .build()
-        .unwrap();
+        .context("Failed to build HTTP client")?;
 
-    let checks = config.urls.iter().map(|url| check_health(&client, url));
+    let checks = config
+        .urls
+        .iter()
+        .map(|url| async move { (url.clone(), check_health(&client, url).await) });
 
     let results = join_all(checks).await;
 
+    let mut has_errors = false;
     for (url, result) in results {
         if let Err(e) = result {
-            println!("Failed to send request to {}: {}", url, e);
+            eprintln!("❌ Error checking {}: {:?}", url, e);
+            has_errors = true;
         }
+    }
+
+    if has_errors {
+        Err(anyhow!("One or more health checks failed"))
+    } else {
+        println!("\nAll health checks passed successfully!");
+        Ok(())
     }
 }
